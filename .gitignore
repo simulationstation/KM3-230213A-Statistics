@@ -1,0 +1,15 @@
+# Local artifacts
+results*/
+*.npz
+
+# Upstream clone (official open-data repo)
+upstream-KM3-230213A-data/
+upstream-KM3-230213A-data/**/.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/

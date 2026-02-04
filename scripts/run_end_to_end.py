@@ -6,6 +6,7 @@ import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -16,10 +17,14 @@ from km3posterior.energy_inference import energy_posterior_from_ntrigpmt, load_f
 from km3posterior.geometry import cherenkov_times_ns, emission_point_solutions_m, unit_from_theta_phi
 from km3posterior.loss_inference import run_loss_posterior_from_track_map
 from km3posterior.sky import (
+    angular_distance_deg,
+    credible_region_from_samples_equirect,
     enu_unit_to_icrs_unit,
     parse_voevent,
     pick_direction_sign_for_voevent,
+    radec_deg_to_unit,
     smear_isotropic_orientation,
+    sky_histogram_equirect,
     summarize_sky_posterior,
     unit_to_radec_deg,
     voevent_astropy_context,
@@ -46,6 +51,10 @@ def main() -> int:
     p.add_argument("--cores", type=int, default=16, help="CPU cores / processes (default: 16)")
     p.add_argument("--seed", type=int, default=230213, help="Base RNG seed (default: 230213)")
     p.add_argument("--quick", action="store_true", help="Reduce compute for a fast smoke run")
+    p.add_argument("--model-comparison", action="store_true", help="Run H1/H2/H3 model comparison and write model_comparison.json")
+    p.add_argument("--model-comp-bundle-sigma-m", type=float, default=50.0, help="H2 prior sigma for bundle transverse offset (meters)")
+    p.add_argument("--model-comp-restarts-h2", type=int, default=8, help="Number of MAP restarts for H2 (bundle)")
+    p.add_argument("--model-comp-outlier-frac", type=float, default=0.01, help="Time-uniform outlier fraction for H1/H2")
     args = p.parse_args()
 
     upstream = Path(args.upstream)
@@ -111,9 +120,14 @@ def main() -> int:
     energy_npz = save_energy_posterior_npz(out_dir / "energy_posterior.npz", energy_post)
 
     # --- Summaries + systematic budget
-    def load_track(npz_path: Path) -> dict[str, np.ndarray]:
+    def load_track(npz_path: Path) -> dict[str, Any]:
         with np.load(npz_path, allow_pickle=False) as f:
-            return {"samples": f["samples"], "map_x": f["map_x"]}
+            out: dict[str, Any] = {"samples": f["samples"], "map_x": f["map_x"]}
+            if "ess" in f:
+                out["ess"] = float(f["ess"])
+            if "selection_indices" in f:
+                out["n_selected_hits"] = int(f["selection_indices"].size)
+            return out
 
     trk = load_track(track_npz)
     trk_fix = load_track(track_fixed_npz)
@@ -122,6 +136,9 @@ def main() -> int:
     u0 = np.mean(u, axis=0)
     u0 /= np.linalg.norm(u0)
     ang = _angle_deg(u, u0)
+
+    theta_deg = float(np.degrees(np.arccos(np.clip(u0[2], -1.0, 1.0))))
+    phi_deg = float(np.degrees(np.arctan2(u0[1], u0[0]) % (2.0 * np.pi)))
 
     u_fix = direction_unit_vectors(trk_fix["samples"])
     u_fix0 = np.mean(u_fix, axis=0)
@@ -195,6 +212,22 @@ def main() -> int:
         np.savez_compressed(sky_stat_path, ra_deg=ra_stat, dec_deg=dec_stat, u_icrs=u_icrs_stat, meta=json.dumps(sign_pick, indent=2))
         sky_stat = summarize_sky_posterior(u_icrs_stat)
         sky_stat["posterior_npz"] = str(sky_stat_path)
+        if vo_info.ra_deg is not None and vo_info.dec_deg is not None:
+            ref = radec_deg_to_unit(vo_info.ra_deg, vo_info.dec_deg)
+            center = radec_deg_to_unit(sky_stat["center_ra_deg"], sky_stat["center_dec_deg"])
+            sky_stat["delta_to_voevent_deg"] = float(angular_distance_deg(center, ref))
+
+        sky_stat_map = sky_histogram_equirect(ra_stat, dec_stat, ra_bins=720, dec_bins=360)
+        sky_stat_map_path = out_dir / "sky_map_stat.npz"
+        np.savez_compressed(
+            sky_stat_map_path,
+            ra_edges_deg=sky_stat_map["ra_edges_deg"],
+            dec_edges_deg=sky_stat_map["dec_edges_deg"],
+            p=sky_stat_map["p"],
+            area_deg2=sky_stat_map["area_deg2"],
+        )
+        sky_stat["map_npz"] = str(sky_stat_map_path)
+        sky_stat["credible_regions_sparse"] = credible_region_from_samples_equirect(ra_stat, dec_stat, d_ra_deg=0.05, d_dec_deg=0.05)
 
         rng = np.random.default_rng(int(args.seed) + 4)
         u_icrs_total = smear_isotropic_orientation(u_icrs_stat, r68_deg=orient_r68, rng=rng)
@@ -211,6 +244,22 @@ def main() -> int:
         sky_total = summarize_sky_posterior(u_icrs_total)
         sky_total["posterior_npz"] = str(sky_total_path)
         sky_total["orientation_r68_deg"] = orient_r68
+        if vo_info.ra_deg is not None and vo_info.dec_deg is not None:
+            ref = radec_deg_to_unit(vo_info.ra_deg, vo_info.dec_deg)
+            center = radec_deg_to_unit(sky_total["center_ra_deg"], sky_total["center_dec_deg"])
+            sky_total["delta_to_voevent_deg"] = float(angular_distance_deg(center, ref))
+
+        sky_total_map = sky_histogram_equirect(ra_tot, dec_tot, ra_bins=720, dec_bins=360)
+        sky_total_map_path = out_dir / "sky_map_total.npz"
+        np.savez_compressed(
+            sky_total_map_path,
+            ra_edges_deg=sky_total_map["ra_edges_deg"],
+            dec_edges_deg=sky_total_map["dec_edges_deg"],
+            p=sky_total_map["p"],
+            area_deg2=sky_total_map["area_deg2"],
+        )
+        sky_total["map_npz"] = str(sky_total_map_path)
+        sky_total["credible_regions_sparse"] = credible_region_from_samples_equirect(ra_tot, dec_tot, d_ra_deg=0.05, d_dec_deg=0.05)
 
         sky = {"sign_choice": sign_pick, "stat_only": sky_stat, "with_orientation": sky_total}
 
@@ -223,8 +272,12 @@ def main() -> int:
         },
         "track": {
             "direction_unit_mean": u0.tolist(),
+            "direction_theta_deg": theta_deg,
+            "direction_phi_deg": phi_deg,
             "direction_r68_stat_deg": r68_stat,
             "direction_r90_stat_deg": float(np.quantile(ang, 0.90)),
+            "n_selected_hits": int(trk.get("n_selected_hits", -1)),
+            "importance_sampling_ess": None if trk.get("ess") is None else float(trk["ess"]),
             "scattering_hyperparams": {
                 "log_sigma_ns": _quantiles(trk["samples"][:, 6]),
                 "log_tau_ns": _quantiles(trk["samples"][:, 7]),
@@ -252,6 +305,7 @@ def main() -> int:
             "voevent_reference": vo_ref,
         },
         "sky": sky,
+        "model_comparison": None,
         "artifacts": {
             "track_posterior": str(track_npz),
             "track_posterior_fixed_scattering": str(track_fixed_npz),
@@ -259,8 +313,30 @@ def main() -> int:
             "energy_posterior": str(energy_npz),
             "sky_posterior_stat": None if sky_stat_path is None else str(sky_stat_path),
             "sky_posterior_total": None if sky_total_path is None else str(sky_total_path),
+            "sky_map_stat": None if vo_info is None else str(out_dir / "sky_map_stat.npz"),
+            "sky_map_total": None if vo_info is None else str(out_dir / "sky_map_total.npz"),
+            "model_comparison": None,
         },
     }
+
+    if args.model_comparison:
+        from km3posterior.model_comparison import ModelComparisonConfig, ModelComparisonLikelihood, ModelComparisonPriors, run_model_comparison
+
+        model_comp_path = out_dir / "model_comparison.json"
+        cfg = ModelComparisonConfig(
+            priors=ModelComparisonPriors(bundle_sigma_offset_m=float(args.model_comp_bundle_sigma_m)),
+            likelihood=ModelComparisonLikelihood(outlier_frac=float(args.model_comp_outlier_frac)),
+            restarts_h1=1,
+            restarts_h2=int(args.model_comp_restarts_h2),
+            seed=int(args.seed) + 10,
+        )
+        model_comp = run_model_comparison(event_path, out_path=model_comp_path, config=cfg)
+        report["model_comparison"] = {
+            "bayes_factors": model_comp.get("bayes_factors", {}),
+            "inputs": model_comp.get("inputs", {}),
+            "config": model_comp.get("config", {}),
+        }
+        report["artifacts"]["model_comparison"] = str(model_comp_path)
 
     (out_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(out_dir / "report.json")

@@ -8,7 +8,11 @@ Goal: a reproducible, end-to-end Bayesian(-ish) posterior over:
 This repo is designed to work directly off the official KM3NeT public release repo.
 
 ## Upstream data
-The official open-data repository is expected at `upstream-KM3-230213A-data/` (clone it yourself or let the agent do it):
+The official open-data repository is expected at `upstream-KM3-230213A-data/` (GitHub: `KM3NeT/KM3-230213A-data`):
+
+```powershell
+git clone https://github.com/KM3NeT/KM3-230213A-data upstream-KM3-230213A-data
+```
 
 - `data/event/KM3-230213A_allhits.json.gz`
 - `data/supplementary/figuresource/figure2.csv`
@@ -27,6 +31,30 @@ For a fast smoke run:
 python scripts/run_end_to_end.py --upstream upstream-KM3-230213A-data --out results-quick --cores 16 --quick
 ```
 
+## Model comparison (H1 vs H2 vs H3)
+Bayesian(-ish) model comparison on hit times for:
+
+- H1: single through-going track
+- H2: simplified muon-bundle (two parallel tracks with a transverse offset + mixture weight; shared direction and time)
+- H3: cascade-like point-source timing model
+- H0: time-uniform null
+
+```powershell
+python scripts/run_model_comparison.py --out results-modelcomp/model_comparison.json --restarts-h2 8 --bundle-sigma-m 50
+```
+
+Example result (KM3-230213A, default selection = first triggered hit per PMT; 3672 hits; `bundle_sigma_m=50`, `outlier_frac=0.01`):
+
+- logB(H2/H1) ~ -9.85  (2-track "bundle" strongly disfavored vs single track)
+- logB(H1/H3) ~ +2555  (single track overwhelmingly favored vs cascade-like point source)
+- logB(H1/H0) ~ +7625  (single track overwhelmingly favored vs time-uniform null)
+
+Or as part of the end-to-end report:
+
+```powershell
+python scripts/run_end_to_end.py --upstream upstream-KM3-230213A-data --out results --cores 16 --model-comparison
+```
+
 ## Outputs
 The pipeline writes:
 
@@ -35,9 +63,13 @@ The pipeline writes:
 - `results/loss_posterior.npz` (stochastic-loss posterior samples from emission hist)
 - `results/energy_posterior.npz` (energy posterior samples + metadata)
 - `results/sky_posterior_stat.npz` (RA/Dec samples mapped from detector coords using VOEvent time/location)
-- `results/sky_posterior_total.npz` (RA/Dec samples convolved with the ~1.5° absolute-orientation systematic)
+- `results/sky_posterior_total.npz` (RA/Dec samples convolved with the ~1.5 deg absolute-orientation systematic)
+- `results/sky_map_stat.npz` / `results/sky_map_total.npz` (simple RA/Dec probability maps on an equirectangular grid, with per-pixel areas)
+- `results/model_comparison.json` (optional; written when `--model-comparison` is enabled)
 
 ## Notes (what this *is* / *isn't*)
 - Track inference uses an exponentially-modified Gaussian timing model (prompt + late light) and marginalizes the late-light scale.
 - Loss inference uses the "emission point along track" construction from the official notebook, but fits it with a Bayesian binned model (baseline + 3 loss components).
 - Energy inference is an approximation from NTrigPMT (Figure 2 source); it is not a full detector-response calorimetric model.
+- Sky mapping assumes detector coordinates behave like ENU and applies the VOEvent ~1.5 deg absolute-orientation systematic as an isotropic random rotation.
+- Model evidences for H1/H2 are computed via a Laplace approximation around the MAP (Gaussian approximation to the posterior).

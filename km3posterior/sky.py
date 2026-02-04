@@ -217,3 +217,153 @@ def summarize_sky_posterior(u_icrs: np.ndarray) -> dict[str, Any]:
         "n_samples": int(u.shape[0]),
         "note": "Containment radii are computed around the posterior mean direction on the sphere.",
     }
+
+
+def sky_histogram_equirect(
+    ra_deg: np.ndarray,
+    dec_deg: np.ndarray,
+    *,
+    ra_bins: int = 720,
+    dec_bins: int = 360,
+) -> dict[str, Any]:
+    """Create a simple RA/Dec probability map on an equirectangular grid.
+
+    Returns a dict with:
+      - ra_edges_deg, dec_edges_deg
+      - p (dec_bin, ra_bin), normalized to sum to 1
+      - area_deg2 (dec_bin, ra_bin)
+    """
+    ra = np.asarray(ra_deg, dtype=np.float64) % 360.0
+    dec = np.asarray(dec_deg, dtype=np.float64)
+
+    ra_edges = np.linspace(0.0, 360.0, int(ra_bins) + 1, dtype=np.float64)
+    dec_edges = np.linspace(-90.0, 90.0, int(dec_bins) + 1, dtype=np.float64)
+
+    # histogram2d uses x/y terminology; we use dec as x and ra as y to get [dec, ra] layout.
+    H, _, _ = np.histogram2d(dec, ra, bins=[dec_edges, ra_edges])
+    total = float(H.sum())
+    p = H / total if total > 0 else H
+
+    ra_edges_rad = np.deg2rad(ra_edges)
+    dec_edges_rad = np.deg2rad(dec_edges)
+    d_ra = ra_edges_rad[1:] - ra_edges_rad[:-1]  # (ra_bins,)
+    d_sin_dec = np.sin(dec_edges_rad[1:]) - np.sin(dec_edges_rad[:-1])  # (dec_bins,)
+    area_sr = d_sin_dec[:, None] * d_ra[None, :]
+    area_deg2 = area_sr * (180.0 / np.pi) ** 2
+
+    return {
+        "ra_edges_deg": ra_edges,
+        "dec_edges_deg": dec_edges,
+        "p": p.astype(np.float64),
+        "area_deg2": area_deg2.astype(np.float64),
+        "n_samples": int(ra.size),
+    }
+
+
+def credible_region_from_map(
+    p: np.ndarray,
+    area_deg2: np.ndarray,
+    *,
+    levels: tuple[float, ...] = (0.50, 0.68, 0.90, 0.99),
+) -> list[dict[str, float]]:
+    """Compute HPD-like regions from a discretized probability map.
+
+    For each level L, finds the smallest set of pixels (by descending p) whose summed p >= L.
+    Returns a list of dicts with p_threshold and area_deg2.
+    """
+    p = np.asarray(p, dtype=np.float64)
+    area = np.asarray(area_deg2, dtype=np.float64)
+    if p.shape != area.shape:
+        raise ValueError("p and area_deg2 must have the same shape.")
+
+    p_flat = p.ravel()
+    area_flat = area.ravel()
+
+    order = np.argsort(p_flat)[::-1]
+    p_sorted = p_flat[order]
+    area_sorted = area_flat[order]
+
+    cdf = np.cumsum(p_sorted)
+    out: list[dict[str, float]] = []
+    for L in levels:
+        L = float(L)
+        if not (0.0 < L < 1.0):
+            continue
+        idx = int(np.searchsorted(cdf, L, side="left"))
+        idx = min(idx, p_sorted.size - 1)
+        thresh = float(p_sorted[idx])
+        area_sum = float(np.sum(area_sorted[: idx + 1]))
+        out.append({"level": L, "p_threshold": thresh, "area_deg2": area_sum})
+    return out
+
+
+def credible_region_from_samples_equirect(
+    ra_deg: np.ndarray,
+    dec_deg: np.ndarray,
+    *,
+    d_ra_deg: float = 0.05,
+    d_dec_deg: float = 0.05,
+    levels: tuple[float, ...] = (0.50, 0.68, 0.90, 0.99),
+) -> dict[str, Any]:
+    """HPD-like regions computed from samples binned on a fine equirectangular grid.
+
+    Uses a sparse binning (only stores non-empty pixels), so it stays fast even for very fine grids.
+    """
+    d_ra_deg = float(d_ra_deg)
+    d_dec_deg = float(d_dec_deg)
+    if not (d_ra_deg > 0 and d_dec_deg > 0):
+        raise ValueError("d_ra_deg and d_dec_deg must be positive.")
+    if abs((360.0 / d_ra_deg) - round(360.0 / d_ra_deg)) > 1e-9:
+        raise ValueError("d_ra_deg must divide 360 exactly for simple binning.")
+    if abs((180.0 / d_dec_deg) - round(180.0 / d_dec_deg)) > 1e-9:
+        raise ValueError("d_dec_deg must divide 180 exactly for simple binning.")
+
+    ra = (np.asarray(ra_deg, dtype=np.float64) % 360.0).copy()
+    dec = np.asarray(dec_deg, dtype=np.float64).copy()
+
+    n = int(ra.size)
+    if n == 0:
+        return {"binning": {"d_ra_deg": d_ra_deg, "d_dec_deg": d_dec_deg}, "regions": []}
+
+    # Clip dec to the open interval [-90, 90) so binning behaves.
+    dec = np.clip(dec, -90.0, np.nextafter(90.0, -np.inf))
+
+    n_ra = int(round(360.0 / d_ra_deg))
+    n_dec = int(round(180.0 / d_dec_deg))
+
+    ra_bin = np.floor(ra / d_ra_deg).astype(np.int64)
+    dec_bin = np.floor((dec + 90.0) / d_dec_deg).astype(np.int64)
+    ra_bin = np.clip(ra_bin, 0, n_ra - 1)
+    dec_bin = np.clip(dec_bin, 0, n_dec - 1)
+
+    flat = dec_bin * n_ra + ra_bin
+    uniq, counts = np.unique(flat, return_counts=True)
+
+    # Pixel areas depend on dec only.
+    dec_i = (uniq // n_ra).astype(np.int64)
+    dec_lo = -90.0 + dec_i.astype(np.float64) * d_dec_deg
+    dec_hi = dec_lo + d_dec_deg
+    d_ra_rad = np.deg2rad(d_ra_deg)
+    area_deg2 = (np.sin(np.deg2rad(dec_hi)) - np.sin(np.deg2rad(dec_lo))) * d_ra_rad * (180.0 / np.pi) ** 2
+
+    p = counts.astype(np.float64) / float(n)
+    order = np.argsort(p)[::-1]
+    p_sorted = p[order]
+    area_sorted = area_deg2[order]
+    cdf = np.cumsum(p_sorted)
+
+    regions: list[dict[str, float]] = []
+    for L in levels:
+        L = float(L)
+        if not (0.0 < L < 1.0):
+            continue
+        idx = int(np.searchsorted(cdf, L, side="left"))
+        idx = min(idx, p_sorted.size - 1)
+        thresh = float(p_sorted[idx])
+        area_sum = float(np.sum(area_sorted[: idx + 1]))
+        regions.append({"level": L, "p_threshold": thresh, "area_deg2": area_sum})
+
+    return {
+        "binning": {"d_ra_deg": d_ra_deg, "d_dec_deg": d_dec_deg, "n_ra": n_ra, "n_dec": n_dec},
+        "regions": regions,
+    }

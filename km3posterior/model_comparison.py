@@ -33,6 +33,11 @@ class ModelComparisonPriors:
     log_tau_sigma: float = 0.7
 
     bundle_sigma_offset_m: float = 50.0
+    bundle_sigma_angle_deg: float = 2.0
+
+    segment_s_min_m: float = -500.0
+    segment_s_max_m: float = 800.0
+    segment_gate_width_m: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,10 @@ class ModelComparisonConfig:
     # Multiple restarts helps avoid local optima in the bundle model.
     restarts_h1: int = 1
     restarts_h2: int = 8
+    restarts_h5: int = 8
+    restarts_h6: int = 12
+    restarts_h7: int = 4
+    restarts_sign: int = 2
 
     # Random seed for restarts.
     seed: int = 230213
@@ -181,6 +190,33 @@ def _orthonormal_basis_perp(u: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return b1, b2
 
 
+def _angular_distance_rad(u: np.ndarray, v: np.ndarray) -> float:
+    u = np.asarray(u, dtype=np.float64).reshape(3)
+    v = np.asarray(v, dtype=np.float64).reshape(3)
+    u /= np.linalg.norm(u)
+    v /= np.linalg.norm(v)
+    c = float(np.clip(float(u @ v), -1.0, 1.0))
+    return float(math.acos(c))
+
+
+def _log_rayleigh(x: float, sigma: float) -> float:
+    x = float(x)
+    sigma = float(sigma)
+    if not (x >= 0.0 and sigma > 0.0):
+        return -math.inf
+    return float(math.log(max(x, 1e-300)) - 2.0 * math.log(sigma) - 0.5 * (x * x) / (sigma * sigma))
+
+
+def _stick_breaking_weights(z1: float, z2: float) -> tuple[float, float, float, float, float]:
+    """Return (w1,w2,w3,u1,u2) with u1=sigmoid(z1), u2=sigmoid(z2)."""
+    u1 = _sigmoid(float(z1))
+    u2 = _sigmoid(float(z2))
+    w1 = u1
+    w2 = (1.0 - w1) * u2
+    w3 = (1.0 - w1) * (1.0 - u2)
+    return float(w1), float(w2), float(w3), float(u1), float(u2)
+
+
 def _loglik_single_track(
     x: np.ndarray,
     *,
@@ -250,6 +286,173 @@ def _loglik_bundle_two_tracks(
     if not (0.0 <= eps < 1.0):
         return -math.inf
     return float(np.logaddexp(np.log1p(-eps) + log_mix, math.log(eps) + log_uni).sum())
+
+
+def _loglik_two_track_nonparallel(
+    x: np.ndarray,
+    *,
+    hit_pos_m: np.ndarray,
+    hit_t_ns: np.ndarray,
+    t_min_ns: float,
+    t_max_ns: float,
+    outlier_frac: float,
+) -> float:
+    """Two-track mixture model with shared position/time but independent directions."""
+    x = np.asarray(x, dtype=np.float64)
+    pos = x[0:3]
+    theta1 = float(x[3])
+    phi1 = float(x[4])
+    theta2 = float(x[5])
+    phi2 = float(x[6])
+    t0 = float(x[7])
+    sigma_ns = float(math.exp(float(x[8])))
+    tau_ns = float(math.exp(float(x[9])))
+    logit_w = float(x[10])
+
+    w = _sigmoid(logit_w)
+    u1 = unit_from_theta_phi(theta1, phi1)
+    u2 = unit_from_theta_phi(theta2, phi2)
+
+    t_pred1, *_ = cherenkov_times_ns(track_pos_m=pos, track_dir=u1, track_t_ns=t0, hit_pos_m=hit_pos_m)
+    t_pred2, *_ = cherenkov_times_ns(track_pos_m=pos, track_dir=u2, track_t_ns=t0, hit_pos_m=hit_pos_m)
+    res1 = hit_t_ns - t_pred1
+    res2 = hit_t_ns - t_pred2
+
+    log1 = logpdf_emg(res1, sigma_ns=sigma_ns, tau_ns=tau_ns, mu_ns=0.0)
+    log2 = logpdf_emg(res2, sigma_ns=sigma_ns, tau_ns=tau_ns, mu_ns=0.0)
+    log_mix = np.logaddexp(math.log(w) + log1, math.log1p(-w) + log2)
+
+    log_uni = -math.log(float(t_max_ns - t_min_ns))
+    eps = float(outlier_frac)
+    if not (0.0 <= eps < 1.0):
+        return -math.inf
+    return float(np.logaddexp(np.log1p(-eps) + log_mix, math.log(eps) + log_uni).sum())
+
+
+def _loglik_bundle_three_tracks_parallel(
+    x: np.ndarray,
+    *,
+    hit_pos_m: np.ndarray,
+    hit_t_ns: np.ndarray,
+    t_min_ns: float,
+    t_max_ns: float,
+    outlier_frac: float,
+) -> float:
+    """Three parallel tracks with transverse offsets and stick-breaking mixture weights."""
+    x = np.asarray(x, dtype=np.float64)
+    pos = x[0:3]
+    theta = float(x[3])
+    phi = float(x[4])
+    t0 = float(x[5])
+    sigma_ns = float(math.exp(float(x[6])))
+    tau_ns = float(math.exp(float(x[7])))
+    off2a = float(x[8])
+    off2b = float(x[9])
+    off3a = float(x[10])
+    off3b = float(x[11])
+    z1 = float(x[12])
+    z2 = float(x[13])
+
+    w1, w2, w3, *_ = _stick_breaking_weights(z1, z2)
+    if not (w1 > 0.0 and w2 > 0.0 and w3 > 0.0):
+        return -math.inf
+
+    u = unit_from_theta_phi(theta, phi)
+    b1, b2 = _orthonormal_basis_perp(u)
+    pos2 = pos + off2a * b1 + off2b * b2
+    pos3 = pos + off3a * b1 + off3b * b2
+
+    t_pred1, *_ = cherenkov_times_ns(track_pos_m=pos, track_dir=u, track_t_ns=t0, hit_pos_m=hit_pos_m)
+    t_pred2, *_ = cherenkov_times_ns(track_pos_m=pos2, track_dir=u, track_t_ns=t0, hit_pos_m=hit_pos_m)
+    t_pred3, *_ = cherenkov_times_ns(track_pos_m=pos3, track_dir=u, track_t_ns=t0, hit_pos_m=hit_pos_m)
+
+    res1 = hit_t_ns - t_pred1
+    res2 = hit_t_ns - t_pred2
+    res3 = hit_t_ns - t_pred3
+
+    log1 = logpdf_emg(res1, sigma_ns=sigma_ns, tau_ns=tau_ns, mu_ns=0.0)
+    log2 = logpdf_emg(res2, sigma_ns=sigma_ns, tau_ns=tau_ns, mu_ns=0.0)
+    log3 = logpdf_emg(res3, sigma_ns=sigma_ns, tau_ns=tau_ns, mu_ns=0.0)
+
+    log_mix12 = np.logaddexp(math.log(w1) + log1, math.log(w2) + log2)
+    log_mix = np.logaddexp(log_mix12, math.log(w3) + log3)
+
+    log_uni = -math.log(float(t_max_ns - t_min_ns))
+    eps = float(outlier_frac)
+    if not (0.0 <= eps < 1.0):
+        return -math.inf
+    return float(np.logaddexp(np.log1p(-eps) + log_mix, math.log(eps) + log_uni).sum())
+
+
+def _decode_ordered_interval(a: float, b: float, *, s_min: float, s_max: float) -> tuple[float, float, float]:
+    """Map unconstrained (a,b) to ordered (s_start,s_stop) in [s_min,s_max] and return log|Jac|."""
+    a = float(a)
+    b = float(b)
+    s_min = float(s_min)
+    s_max = float(s_max)
+    if not (s_max > s_min):
+        raise ValueError("Invalid segment bounds.")
+
+    span = s_max - s_min
+    u1 = _sigmoid(a)
+    s_start = s_min + span * u1
+    u2 = _sigmoid(b)
+    s_stop = s_start + (s_max - s_start) * u2
+
+    # Determinant is triangular: d s_start/da * d s_stop/db
+    d_start_da = span * u1 * (1.0 - u1)
+    d_stop_db = (s_max - s_start) * u2 * (1.0 - u2)
+    log_jac = math.log(max(d_start_da, 1e-300)) + math.log(max(d_stop_db, 1e-300))
+    return float(s_start), float(s_stop), float(log_jac)
+
+
+def _loglik_segment_track(
+    x: np.ndarray,
+    *,
+    hit_pos_m: np.ndarray,
+    hit_t_ns: np.ndarray,
+    t_min_ns: float,
+    t_max_ns: float,
+    outlier_frac: float,
+    s_min_m: float,
+    s_max_m: float,
+    gate_width_m: float,
+) -> float:
+    """Single-track model with emission constrained to a finite segment along the track."""
+    x = np.asarray(x, dtype=np.float64)
+    pos = x[0:3]
+    theta = float(x[3])
+    phi = float(x[4])
+    t0 = float(x[5])
+    sigma_ns = float(math.exp(float(x[6])))
+    tau_ns = float(math.exp(float(x[7])))
+    a = float(x[8])
+    b = float(x[9])
+
+    u = unit_from_theta_phi(theta, phi)
+    t_pred, _, _, s_emit = cherenkov_times_ns(track_pos_m=pos, track_dir=u, track_t_ns=t0, hit_pos_m=hit_pos_m)
+    res = hit_t_ns - t_pred
+
+    s_start, s_stop, _ = _decode_ordered_interval(a, b, s_min=float(s_min_m), s_max=float(s_max_m))
+    w = float(gate_width_m)
+    if not (w > 0.0):
+        return -math.inf
+
+    g1 = 1.0 / (1.0 + np.exp(-(s_emit - s_start) / w))
+    g2 = 1.0 / (1.0 + np.exp(-(s_stop - s_emit) / w))
+    g = np.clip(g1 * g2, 0.0, 1.0)
+
+    log_core = logpdf_emg(res, sigma_ns=sigma_ns, tau_ns=tau_ns, mu_ns=0.0)
+    log_uni = -math.log(float(t_max_ns - t_min_ns))
+
+    eps = float(outlier_frac)
+    if not (0.0 <= eps < 1.0):
+        return -math.inf
+
+    w_eff = np.clip((1.0 - eps) * g, 1e-12, 1.0 - 1e-12)
+    w_uni = 1.0 - w_eff
+    log_mix = np.logaddexp(np.log(w_eff) + log_core, np.log(w_uni) + log_uni)
+    return float(log_mix.sum())
 
 
 def _loglik_cascade(
@@ -471,10 +674,138 @@ def _logprior_h4_beta_track(
     return float(lp)
 
 
+def _logprior_h5_two_track_nonparallel(
+    x: np.ndarray,
+    *,
+    evt: EventData,
+    pri: ModelComparisonPriors,
+) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    pos = x[0:3]
+    theta1 = float(x[3])
+    phi1 = float(x[4])
+    theta2 = float(x[5])
+    phi2 = float(x[6])
+    t0 = float(x[7])
+    log_sigma = float(x[8])
+    log_tau = float(x[9])
+    logit_w = float(x[10])
+
+    w = _sigmoid(logit_w)
+
+    u1 = unit_from_theta_phi(theta1, phi1)
+    u2 = unit_from_theta_phi(theta2, phi2)
+
+    lp = 0.0
+    lp += _log_normal_vec(pos, evt.reco_pos_m, pri.sigma_pos_m)
+    lp += _log_dir_prior_theta_phi(theta1, phi1, reco_dir=evt.reco_dir, kappa=pri.dir_kappa)
+    lp += _log_dir_prior_theta_phi(theta2, phi2, reco_dir=evt.reco_dir, kappa=pri.dir_kappa)
+    lp += _log_normal_scalar(t0, float(evt.reco_t_ns), pri.sigma_t_ns)
+    lp += _log_normal_scalar(log_sigma, pri.log_sigma_mu, pri.log_sigma_sigma)
+    lp += _log_normal_scalar(log_tau, pri.log_tau_mu, pri.log_tau_sigma)
+
+    # Encourage bundle-like near-parallel tracks without enforcing it.
+    sigma_ang = math.radians(float(pri.bundle_sigma_angle_deg))
+    lp += _log_rayleigh(_angular_distance_rad(u1, u2), sigma_ang)
+
+    # Uniform prior on w in [0,1] transformed from logit(w): p(z)=w(1-w).
+    lp += math.log(max(w, 1e-300)) + math.log(max(1.0 - w, 1e-300))
+    return float(lp)
+
+
+def _logprior_h6_bundle_three_tracks_parallel(
+    x: np.ndarray,
+    *,
+    evt: EventData,
+    pri: ModelComparisonPriors,
+) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    pos = x[0:3]
+    theta = float(x[3])
+    phi = float(x[4])
+    t0 = float(x[5])
+    log_sigma = float(x[6])
+    log_tau = float(x[7])
+    off2a = float(x[8])
+    off2b = float(x[9])
+    off3a = float(x[10])
+    off3b = float(x[11])
+    z1 = float(x[12])
+    z2 = float(x[13])
+
+    _, _, _, u1, u2 = _stick_breaking_weights(z1, z2)
+
+    lp = 0.0
+    lp += _log_normal_vec(pos, evt.reco_pos_m, pri.sigma_pos_m)
+    lp += _log_dir_prior_theta_phi(theta, phi, reco_dir=evt.reco_dir, kappa=pri.dir_kappa)
+    lp += _log_normal_scalar(t0, float(evt.reco_t_ns), pri.sigma_t_ns)
+    lp += _log_normal_scalar(log_sigma, pri.log_sigma_mu, pri.log_sigma_sigma)
+    lp += _log_normal_scalar(log_tau, pri.log_tau_mu, pri.log_tau_sigma)
+
+    # Offsets: i.i.d. 2D Gaussian in transverse plane.
+    lp += _log_normal_scalar(off2a, 0.0, pri.bundle_sigma_offset_m)
+    lp += _log_normal_scalar(off2b, 0.0, pri.bundle_sigma_offset_m)
+    lp += _log_normal_scalar(off3a, 0.0, pri.bundle_sigma_offset_m)
+    lp += _log_normal_scalar(off3b, 0.0, pri.bundle_sigma_offset_m)
+
+    # u1,u2 stick-breaking uniforms -> add logistic Jacobians for z1,z2.
+    lp += math.log(max(u1, 1e-300)) + math.log(max(1.0 - u1, 1e-300))
+    lp += math.log(max(u2, 1e-300)) + math.log(max(1.0 - u2, 1e-300))
+    return float(lp)
+
+
+def _logprior_h7_segment_track(
+    x: np.ndarray,
+    *,
+    evt: EventData,
+    pri: ModelComparisonPriors,
+) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    pos = x[0:3]
+    theta = float(x[3])
+    phi = float(x[4])
+    t0 = float(x[5])
+    log_sigma = float(x[6])
+    log_tau = float(x[7])
+    a = float(x[8])
+    b = float(x[9])
+
+    lp = 0.0
+    lp += _log_normal_vec(pos, evt.reco_pos_m, pri.sigma_pos_m)
+    lp += _log_dir_prior_theta_phi(theta, phi, reco_dir=evt.reco_dir, kappa=pri.dir_kappa)
+    lp += _log_normal_scalar(t0, float(evt.reco_t_ns), pri.sigma_t_ns)
+    lp += _log_normal_scalar(log_sigma, pri.log_sigma_mu, pri.log_sigma_sigma)
+    lp += _log_normal_scalar(log_tau, pri.log_tau_mu, pri.log_tau_sigma)
+
+    # Uniform prior over ordered (s_start,s_stop) within [s_min,s_max] via transform Jacobian.
+    _, _, log_jac = _decode_ordered_interval(a, b, s_min=float(pri.segment_s_min_m), s_max=float(pri.segment_s_max_m))
+    lp += float(log_jac)
+    return float(lp)
+
 def _pack_initial_h1(evt: EventData) -> np.ndarray:
     # Start at published reco.
     # Convert reco_dir to (theta,phi).
     u = evt.reco_dir
+    theta = float(math.acos(float(np.clip(u[2], -1.0, 1.0))))
+    phi = float(math.atan2(float(u[1]), float(u[0])) % (2.0 * math.pi))
+    return np.array(
+        [
+            evt.reco_pos_m[0],
+            evt.reco_pos_m[1],
+            evt.reco_pos_m[2],
+            theta,
+            phi,
+            float(evt.reco_t_ns),
+            math.log(3.0),
+            math.log(60.0),
+        ],
+        dtype=np.float64,
+    )
+
+
+def _pack_initial_h1_with_dir(evt: EventData, dir_mean: np.ndarray) -> np.ndarray:
+    u = np.asarray(dir_mean, dtype=np.float64).reshape(3)
+    u /= np.linalg.norm(u)
     theta = float(math.acos(float(np.clip(u[2], -1.0, 1.0))))
     phi = float(math.atan2(float(u[1]), float(u[0])) % (2.0 * math.pi))
     return np.array(
@@ -516,6 +847,37 @@ def _pack_initial_h4(evt: EventData) -> np.ndarray:
     # z_beta=+8 puts beta extremely close to 1 without sitting exactly at the boundary.
     x = _pack_initial_h1(evt)
     return np.concatenate([x, np.array([8.0], dtype=np.float64)], axis=0)
+
+
+def _pack_initial_h5(evt: EventData) -> np.ndarray:
+    x = _pack_initial_h1(evt)
+    return np.array(
+        [
+            x[0],
+            x[1],
+            x[2],
+            x[3],
+            x[4],
+            x[3],
+            x[4],
+            x[5],
+            x[6],
+            x[7],
+            0.0,
+        ],
+        dtype=np.float64,
+    )
+
+
+def _pack_initial_h6(evt: EventData) -> np.ndarray:
+    x = _pack_initial_h1(evt)
+    return np.concatenate([x, np.zeros(6, dtype=np.float64)], axis=0)
+
+
+def _pack_initial_h7(evt: EventData) -> np.ndarray:
+    x = _pack_initial_h1(evt)
+    # Start near s_min and stop near s_max.
+    return np.concatenate([x, np.array([-6.0, 6.0], dtype=np.float64)], axis=0)
 
 
 def _fit_map_generic(
@@ -636,6 +998,54 @@ def run_model_comparison(
     log_joint_h1 = -float(fit_h1["neg_log_joint_at_map"])
     logZ_h1 = laplace_log_evidence(fit_h1["map_x"], fit_h1["hessian"] + fit_h1["hessian_jitter"] * np.eye(8), log_joint_at_map=log_joint_h1)
 
+    # --- Direction sign test: same model but prior centered on -reco_dir
+    x0_h1m = _pack_initial_h1_with_dir(evt, -evt.reco_dir)
+
+    def neg_log_joint_h1m(x: np.ndarray) -> float:
+        x = np.asarray(x, dtype=np.float64)
+        pos = x[0:3]
+        theta = float(x[3])
+        phi = float(x[4])
+        t0 = float(x[5])
+        log_sigma = float(x[6])
+        log_tau = float(x[7])
+
+        lp = 0.0
+        lp += _log_normal_vec(pos, evt.reco_pos_m, pri.sigma_pos_m)
+        lp += _log_dir_prior_theta_phi(theta, phi, reco_dir=-evt.reco_dir, kappa=pri.dir_kappa)
+        lp += _log_normal_scalar(t0, float(evt.reco_t_ns), pri.sigma_t_ns)
+        lp += _log_normal_scalar(log_sigma, pri.log_sigma_mu, pri.log_sigma_sigma)
+        lp += _log_normal_scalar(log_tau, pri.log_tau_mu, pri.log_tau_sigma)
+        if not np.isfinite(lp):
+            return float("inf")
+
+        ll = _loglik_single_track(
+            x,
+            hit_pos_m=hit_pos,
+            hit_t_ns=hit_t,
+            t_min_ns=t_min,
+            t_max_ns=t_max,
+            outlier_frac=lik.outlier_frac,
+        )
+        if not np.isfinite(ll):
+            return float("inf")
+        return -(ll + float(lp))
+
+    fit_h1m = _fit_map_generic(
+        x0=x0_h1m,
+        bounds=bounds_h1,
+        neg_log_joint=neg_log_joint_h1m,
+        step=step_h1,
+        restarts=int(config.restarts_sign),
+        seed=config.seed + 9,
+    )
+    log_joint_h1m = -float(fit_h1m["neg_log_joint_at_map"])
+    logZ_h1m = laplace_log_evidence(
+        fit_h1m["map_x"],
+        fit_h1m["hessian"] + fit_h1m["hessian_jitter"] * np.eye(8),
+        log_joint_at_map=log_joint_h1m,
+    )
+
     # --- H2: 2-track bundle (shared direction and time; transverse offset + mixture weight)
     x0_h2 = _pack_initial_h2(evt)
     bounds_h2 = bounds_h1 + [
@@ -674,6 +1084,136 @@ def run_model_comparison(
         fit_h2["map_x"],
         fit_h2["hessian"] + fit_h2["hessian_jitter"] * np.eye(11),
         log_joint_at_map=log_joint_h2,
+    )
+
+    # --- H5: 2-track non-parallel bundle (shared position/time; independent directions)
+    x0_h5 = _pack_initial_h5(evt)
+    bounds_h5 = [
+        (None, None),
+        (None, None),
+        (None, None),
+        (1e-6, math.pi - 1e-6),  # theta1
+        (0.0, 2.0 * math.pi),  # phi1
+        (1e-6, math.pi - 1e-6),  # theta2
+        (0.0, 2.0 * math.pi),  # phi2
+        (float(evt.reco_t_ns) - 10_000.0, float(evt.reco_t_ns) + 10_000.0),
+        (math.log(0.2), math.log(30.0)),
+        (math.log(1.0), math.log(2_000.0)),
+        (-8.0, 8.0),  # logit_w
+    ]
+
+    def neg_log_joint_h5(x: np.ndarray) -> float:
+        lp = _logprior_h5_two_track_nonparallel(x, evt=evt, pri=pri)
+        if not np.isfinite(lp):
+            return float("inf")
+        ll = _loglik_two_track_nonparallel(
+            x,
+            hit_pos_m=hit_pos,
+            hit_t_ns=hit_t,
+            t_min_ns=t_min,
+            t_max_ns=t_max,
+            outlier_frac=lik.outlier_frac,
+        )
+        if not np.isfinite(ll):
+            return float("inf")
+        return -(ll + lp)
+
+    step_h5 = np.array([0.5, 0.5, 0.5, 2e-4, 2e-4, 2e-4, 2e-4, 1.0, 1e-2, 1e-2, 0.1], dtype=np.float64)
+    fit_h5 = _fit_map_generic(
+        x0=x0_h5,
+        bounds=bounds_h5,
+        neg_log_joint=neg_log_joint_h5,
+        step=step_h5,
+        restarts=int(config.restarts_h5),
+        seed=config.seed + 4,
+    )
+    log_joint_h5 = -float(fit_h5["neg_log_joint_at_map"])
+    logZ_h5 = laplace_log_evidence(
+        fit_h5["map_x"],
+        fit_h5["hessian"] + fit_h5["hessian_jitter"] * np.eye(11),
+        log_joint_at_map=log_joint_h5,
+    )
+
+    # --- H6: 3-track parallel bundle (transverse offsets + mixture weights)
+    x0_h6 = _pack_initial_h6(evt)
+    bounds_h6 = bounds_h1 + [
+        (-300.0, 300.0),  # off2a
+        (-300.0, 300.0),  # off2b
+        (-300.0, 300.0),  # off3a
+        (-300.0, 300.0),  # off3b
+        (-8.0, 8.0),  # z1
+        (-8.0, 8.0),  # z2
+    ]
+
+    def neg_log_joint_h6(x: np.ndarray) -> float:
+        lp = _logprior_h6_bundle_three_tracks_parallel(x, evt=evt, pri=pri)
+        if not np.isfinite(lp):
+            return float("inf")
+        ll = _loglik_bundle_three_tracks_parallel(
+            x,
+            hit_pos_m=hit_pos,
+            hit_t_ns=hit_t,
+            t_min_ns=t_min,
+            t_max_ns=t_max,
+            outlier_frac=lik.outlier_frac,
+        )
+        if not np.isfinite(ll):
+            return float("inf")
+        return -(ll + lp)
+
+    step_h6 = np.array([0.5, 0.5, 0.5, 2e-4, 2e-4, 1.0, 1e-2, 1e-2, 1.0, 1.0, 1.0, 1.0, 0.2, 0.2], dtype=np.float64)
+    fit_h6 = _fit_map_generic(
+        x0=x0_h6,
+        bounds=bounds_h6,
+        neg_log_joint=neg_log_joint_h6,
+        step=step_h6,
+        restarts=int(config.restarts_h6),
+        seed=config.seed + 5,
+    )
+    log_joint_h6 = -float(fit_h6["neg_log_joint_at_map"])
+    logZ_h6 = laplace_log_evidence(
+        fit_h6["map_x"],
+        fit_h6["hessian"] + fit_h6["hessian_jitter"] * np.eye(14),
+        log_joint_at_map=log_joint_h6,
+    )
+
+    # --- H7: finite segment track (tests starting/stopping behavior)
+    x0_h7 = _pack_initial_h7(evt)
+    bounds_h7 = bounds_h1 + [(-10.0, 10.0), (-10.0, 10.0)]
+
+    def neg_log_joint_h7(x: np.ndarray) -> float:
+        lp = _logprior_h7_segment_track(x, evt=evt, pri=pri)
+        if not np.isfinite(lp):
+            return float("inf")
+        ll = _loglik_segment_track(
+            x,
+            hit_pos_m=hit_pos,
+            hit_t_ns=hit_t,
+            t_min_ns=t_min,
+            t_max_ns=t_max,
+            outlier_frac=lik.outlier_frac,
+            s_min_m=float(pri.segment_s_min_m),
+            s_max_m=float(pri.segment_s_max_m),
+            gate_width_m=float(pri.segment_gate_width_m),
+        )
+        if not np.isfinite(ll):
+            return float("inf")
+        return -(ll + lp)
+
+    step_h7 = np.array([0.5, 0.5, 0.5, 2e-4, 2e-4, 1.0, 1e-2, 1e-2, 0.2, 0.2], dtype=np.float64)
+    fit_h7 = _fit_map_generic(
+        x0=x0_h7,
+        bounds=bounds_h7,
+        neg_log_joint=neg_log_joint_h7,
+        step=step_h7,
+        restarts=int(config.restarts_h7),
+        seed=config.seed + 6,
+    )
+    log_joint_h7 = -float(fit_h7["neg_log_joint_at_map"])
+    logZ_h7 = laplace_log_evidence(
+        fit_h7["map_x"],
+        fit_h7["hessian"] + fit_h7["hessian_jitter"] * np.eye(10),
+        log_joint_at_map=log_joint_h7,
     )
 
     # --- H3: cascade-like point source
@@ -788,6 +1328,33 @@ def run_model_comparison(
     offset_vec = float(x2[8]) * b1 + float(x2[9]) * b2
     offset_norm_m = float(np.linalg.norm(offset_vec))
 
+    # H5 derived params.
+    x5 = np.asarray(fit_h5["map_x"], dtype=np.float64)
+    w5 = _sigmoid(float(x5[10]))
+    u5_1 = unit_from_theta_phi(float(x5[3]), float(x5[4]))
+    u5_2 = unit_from_theta_phi(float(x5[5]), float(x5[6]))
+    h5_angle_sep_deg = float(np.degrees(_angular_distance_rad(u5_1, u5_2)))
+
+    # H6 derived params.
+    x6 = np.asarray(fit_h6["map_x"], dtype=np.float64)
+    w6_1, w6_2, w6_3, *_ = _stick_breaking_weights(float(x6[12]), float(x6[13]))
+    u6 = unit_from_theta_phi(float(x6[3]), float(x6[4]))
+    b1_6, b2_6 = _orthonormal_basis_perp(u6)
+    off2_vec = float(x6[8]) * b1_6 + float(x6[9]) * b2_6
+    off3_vec = float(x6[10]) * b1_6 + float(x6[11]) * b2_6
+    off2_norm_m = float(np.linalg.norm(off2_vec))
+    off3_norm_m = float(np.linalg.norm(off3_vec))
+    off23_sep_m = float(np.linalg.norm(off2_vec - off3_vec))
+
+    # H7 derived params.
+    x7 = np.asarray(fit_h7["map_x"], dtype=np.float64)
+    s7_start, s7_stop, _ = _decode_ordered_interval(
+        float(x7[8]),
+        float(x7[9]),
+        s_min=float(pri.segment_s_min_m),
+        s_max=float(pri.segment_s_max_m),
+    )
+
     # Beta-track derived params.
     x4 = np.asarray(fit_h4["map_x"], dtype=np.float64)
     w4 = _sigmoid(float(x4[8]))
@@ -800,6 +1367,14 @@ def run_model_comparison(
         beta_sigma = float(abs(db_dz) * zsig)
     except Exception:
         beta_sigma = None
+
+    direction_sign_test = {
+        "logZ_dir_plus": float(logZ_h1),
+        "logZ_dir_minus": float(logZ_h1m),
+        "logB_plus_over_minus": float(logZ_h1 - logZ_h1m),
+        "plus_map": unpack_dir(fit_h1["map_x"]),
+        "minus_map": unpack_dir(fit_h1m["map_x"]),
+    }
 
     results = {
         "inputs": {
@@ -815,8 +1390,13 @@ def run_model_comparison(
             "likelihood": asdict(lik),
             "restarts_h1": int(config.restarts_h1),
             "restarts_h2": int(config.restarts_h2),
+            "restarts_h5": int(config.restarts_h5),
+            "restarts_h6": int(config.restarts_h6),
+            "restarts_h7": int(config.restarts_h7),
+            "restarts_sign": int(config.restarts_sign),
             "seed": int(config.seed),
         },
+        "direction_sign_test": direction_sign_test,
         "models": {
             "H1_single_track": {
                 "map": {
@@ -843,6 +1423,62 @@ def run_model_comparison(
                 },
                 "log_joint_at_map": log_joint_h2,
                 "log_evidence_laplace": logZ_h2,
+            },
+            "H5_two_track_nonparallel": {
+                "map": {
+                    "pos_m": [float(v) for v in x5[0:3]],
+                    "t0_ns": float(x5[7]),
+                    "log_sigma_ns": float(x5[8]),
+                    "log_tau_ns": float(x5[9]),
+                    "w_track1": float(w5),
+                    "angle_sep_deg": h5_angle_sep_deg,
+                    "track1": unpack_dir(np.array([x5[0], x5[1], x5[2], x5[3], x5[4]])),
+                    "track2": {
+                        "theta_deg": float(np.degrees(float(x5[5]))),
+                        "phi_deg": float(np.degrees(float(x5[6])) % 360.0),
+                        "u_x": float(u5_2[0]),
+                        "u_y": float(u5_2[1]),
+                        "u_z": float(u5_2[2]),
+                    },
+                },
+                "log_joint_at_map": log_joint_h5,
+                "log_evidence_laplace": logZ_h5,
+            },
+            "H6_bundle_three_tracks_parallel": {
+                "map": {
+                    "pos1_m": [float(v) for v in x6[0:3]],
+                    "t0_ns": float(x6[5]),
+                    "log_sigma_ns": float(x6[6]),
+                    "log_tau_ns": float(x6[7]),
+                    "offset2_a_m": float(x6[8]),
+                    "offset2_b_m": float(x6[9]),
+                    "offset3_a_m": float(x6[10]),
+                    "offset3_b_m": float(x6[11]),
+                    "offset2_norm_m": off2_norm_m,
+                    "offset3_norm_m": off3_norm_m,
+                    "offset23_sep_m": off23_sep_m,
+                    "w1": float(w6_1),
+                    "w2": float(w6_2),
+                    "w3": float(w6_3),
+                    **unpack_dir(x6),
+                },
+                "log_joint_at_map": log_joint_h6,
+                "log_evidence_laplace": logZ_h6,
+            },
+            "H7_segment_track": {
+                "map": {
+                    "pos_m": [float(v) for v in x7[0:3]],
+                    "t0_ns": float(x7[5]),
+                    "log_sigma_ns": float(x7[6]),
+                    "log_tau_ns": float(x7[7]),
+                    "s_start_m": float(s7_start),
+                    "s_stop_m": float(s7_stop),
+                    "segment_length_m": float(s7_stop - s7_start),
+                    "gate_width_m": float(pri.segment_gate_width_m),
+                    **unpack_dir(x7),
+                },
+                "log_joint_at_map": log_joint_h7,
+                "log_evidence_laplace": logZ_h7,
             },
             "H3_cascade_point_source": {
                 "map": {
@@ -875,21 +1511,38 @@ def run_model_comparison(
         "bayes_factors": {
             "logB_H2_over_H1": float(logZ_h2 - logZ_h1),
             "B_H2_over_H1": float(math.exp(min(700.0, max(-700.0, logZ_h2 - logZ_h1)))),
+            "logB_H5_over_H1": float(logZ_h5 - logZ_h1),
+            "logB_H6_over_H1": float(logZ_h6 - logZ_h1),
+            "logB_H7_over_H1": float(logZ_h7 - logZ_h1),
+            "logB_H5_over_H2": float(logZ_h5 - logZ_h2),
+            "logB_H6_over_H2": float(logZ_h6 - logZ_h2),
+            "logB_H7_over_H2": float(logZ_h7 - logZ_h2),
             "logB_H1_over_H3": float(logZ_h1 - logZ_h3),
             "logB_H2_over_H3": float(logZ_h2 - logZ_h3),
+            "logB_H5_over_H3": float(logZ_h5 - logZ_h3),
+            "logB_H6_over_H3": float(logZ_h6 - logZ_h3),
+            "logB_H7_over_H3": float(logZ_h7 - logZ_h3),
             "logB_H1_over_H0": float(logZ_h1 - logZ_h0),
             "logB_H2_over_H0": float(logZ_h2 - logZ_h0),
             "logB_H3_over_H0": float(logZ_h3 - logZ_h0),
+            "logB_H5_over_H0": float(logZ_h5 - logZ_h0),
+            "logB_H6_over_H0": float(logZ_h6 - logZ_h0),
+            "logB_H7_over_H0": float(logZ_h7 - logZ_h0),
             "logB_H4_over_H1": float(logZ_h4 - logZ_h1),
             "logB_H1_over_H4": float(logZ_h1 - logZ_h4),
             "logB_H4_over_H0": float(logZ_h4 - logZ_h0),
+            "logB_H1_over_H1_dir_minus": float(logZ_h1 - logZ_h1m),
         },
         "notes": [
             "Evidences for H1/H2 are Laplace approximations around the MAP (Gaussian approximation to the posterior).",
             "H2 is a simplified 'bundle' model: two parallel tracks with a transverse offset and a mixture weight; shared direction and time.",
+            "H5 is a simplified non-parallel bundle: two tracks with independent directions but shared position/time and a mixture weight.",
+            "H6 is a simplified 3-track parallel bundle: three tracks with transverse offsets and stick-breaking mixture weights.",
+            "H7 constrains emission to a finite segment along the track (tests starting/stopping behavior).",
             "H3 is a cascade-like point-source timing model (t_pred=t0+|r-r0|/v_g).",
             "H0 is a minimal null: hit times are i.i.d. uniform over the selected hit time range.",
             "H4 is a single-track timing model with beta<1 (LLCP-like); Cherenkov angle uses cos(theta_c)=1/(n*beta).",
+            "Direction sign test fits H1 with a direction prior centered on reco_dir vs -reco_dir.",
         ],
     }
 

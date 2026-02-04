@@ -38,6 +38,7 @@ Bayesian(-ish) model comparison on hit times for:
 - H2: simplified muon-bundle (two parallel tracks with a transverse offset + mixture weight; shared direction and time)
 - H3: cascade-like point-source timing model
 - H0: time-uniform null
+- H4: beta<1 track (LLCP-like timing; tests for a slower-than-light charged particle)
 
 ```powershell
 python scripts/run_model_comparison.py --out results-modelcomp/model_comparison.json --restarts-h2 8 --bundle-sigma-m 50
@@ -48,6 +49,7 @@ Example result (KM3-230213A, default selection = first triggered hit per PMT; 36
 - logB(H2/H1) ~ -9.85  (2-track "bundle" strongly disfavored vs single track)
 - logB(H1/H3) ~ +2555  (single track overwhelmingly favored vs cascade-like point source)
 - logB(H1/H0) ~ +7625  (single track overwhelmingly favored vs time-uniform null)
+- logB(H1/H4) ~ +9.71  (beta<1 track disfavored; best-fit beta ~ 0.99991)
 
 Or as part of the end-to-end report:
 

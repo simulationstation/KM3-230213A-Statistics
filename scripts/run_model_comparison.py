@@ -40,6 +40,16 @@ def main() -> int:
     print("logB(H2/H1):", bf["logB_H2_over_H1"])
     print("logB(H1/H3):", bf["logB_H1_over_H3"])
     print("logB(H1/H0):", bf["logB_H1_over_H0"])
+    if "logB_H1_over_H4" in bf:
+        print("logB(H1/H4):", bf["logB_H1_over_H4"])
+        h4 = res["models"]["H4_beta_track"]["map"]
+        beta = h4.get("beta")
+        beta_sig = h4.get("beta_sigma_laplace")
+        if beta is not None:
+            if beta_sig is None:
+                print("H4 beta:", beta)
+            else:
+                print("H4 beta:", beta, "+/-", beta_sig)
     print("H2 offset_norm_m:", res["models"]["H2_bundle_two_tracks"]["map"]["offset_norm_m"])
     print("H2 w_track1:", res["models"]["H2_bundle_two_tracks"]["map"]["w_track1"])
     return 0

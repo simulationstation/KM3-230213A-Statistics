@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 from scipy.optimize import minimize
 
-from .constants import V_LIGHT
+from .constants import C_LIGHT, V_LIGHT, WATER_INDEX
 from .data import EventData, load_event_json_gz
 from .geometry import cherenkov_times_ns, unit_from_theta_phi
 from .timing_model import logpdf_emg
@@ -283,6 +283,85 @@ def _loglik_cascade(
     return float(np.logaddexp(np.log1p(-eps) + log_core, math.log(eps) + log_uni).sum())
 
 
+def _cherenkov_times_beta_ns(
+    *,
+    track_pos_m: np.ndarray,
+    track_dir: np.ndarray,
+    track_t_ns: float,
+    hit_pos_m: np.ndarray,
+    beta: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Generalization of the earliest-arrival model to a particle with speed beta*c.
+
+    Uses Cherenkov angle cos(theta_c)=1/(n*beta); for beta<=1/n, returns inf predicted times.
+    """
+    track_pos_m = np.asarray(track_pos_m, dtype=np.float64).reshape(3)
+    track_dir = np.asarray(track_dir, dtype=np.float64).reshape(3)
+    track_dir = track_dir / np.linalg.norm(track_dir)
+    hit_pos_m = np.asarray(hit_pos_m, dtype=np.float64)
+
+    beta = float(beta)
+    if not (beta > 0.0):
+        n = hit_pos_m.shape[0]
+        inf = np.full(n, np.inf, dtype=np.float64)
+        return inf, inf, inf, inf
+
+    cos_tc = 1.0 / (float(WATER_INDEX) * beta)
+    if cos_tc >= 1.0:
+        n = hit_pos_m.shape[0]
+        inf = np.full(n, np.inf, dtype=np.float64)
+        return inf, inf, inf, inf
+
+    sin_tc = math.sqrt(max(0.0, 1.0 - cos_tc * cos_tc))
+    tan_tc = sin_tc / cos_tc
+
+    v = hit_pos_m - track_pos_m[None, :]
+    l = v @ track_dir  # (N,)
+    v2 = np.einsum("ij,ij->i", v, v)
+    k2 = np.maximum(v2 - l * l, 0.0)
+
+    d_closest_m = np.sqrt(k2)
+    d_photon_m = d_closest_m / max(sin_tc, 1e-12)
+    d_trk_m = l - d_closest_m / max(tan_tc, 1e-12)
+
+    t_pred_ns = float(track_t_ns) + d_trk_m / (beta * float(C_LIGHT)) + d_photon_m / float(V_LIGHT)
+    return t_pred_ns, d_closest_m, d_photon_m, d_trk_m
+
+
+def _loglik_single_track_beta(
+    x: np.ndarray,
+    *,
+    hit_pos_m: np.ndarray,
+    hit_t_ns: np.ndarray,
+    t_min_ns: float,
+    t_max_ns: float,
+    outlier_frac: float,
+    beta_min: float,
+) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    pos = x[0:3]
+    theta = float(x[3])
+    phi = float(x[4])
+    t0 = float(x[5])
+    sigma_ns = float(math.exp(float(x[6])))
+    tau_ns = float(math.exp(float(x[7])))
+    z_beta = float(x[8])
+
+    w = _sigmoid(z_beta)
+    beta = float(beta_min + (1.0 - beta_min) * w)
+
+    u = unit_from_theta_phi(theta, phi)
+    t_pred, *_ = _cherenkov_times_beta_ns(track_pos_m=pos, track_dir=u, track_t_ns=t0, hit_pos_m=hit_pos_m, beta=beta)
+    res = hit_t_ns - t_pred
+
+    log_core = logpdf_emg(res, sigma_ns=sigma_ns, tau_ns=tau_ns, mu_ns=0.0)
+    log_uni = -math.log(float(t_max_ns - t_min_ns))
+    eps = float(outlier_frac)
+    if not (0.0 <= eps < 1.0):
+        return -math.inf
+    return float(np.logaddexp(np.log1p(-eps) + log_core, math.log(eps) + log_uni).sum())
+
+
 def _logprior_h1(
     x: np.ndarray,
     *,
@@ -361,6 +440,37 @@ def _logprior_h3_cascade(
     return float(lp)
 
 
+def _logprior_h4_beta_track(
+    x: np.ndarray,
+    *,
+    evt: EventData,
+    pri: ModelComparisonPriors,
+    beta_min: float,
+) -> float:
+    x = np.asarray(x, dtype=np.float64)
+    pos = x[0:3]
+    theta = float(x[3])
+    phi = float(x[4])
+    t0 = float(x[5])
+    log_sigma = float(x[6])
+    log_tau = float(x[7])
+    z_beta = float(x[8])
+
+    lp = 0.0
+    lp += _log_normal_vec(pos, evt.reco_pos_m, pri.sigma_pos_m)
+    lp += _log_dir_prior_theta_phi(theta, phi, reco_dir=evt.reco_dir, kappa=pri.dir_kappa)
+    lp += _log_normal_scalar(t0, float(evt.reco_t_ns), pri.sigma_t_ns)
+    lp += _log_normal_scalar(log_sigma, pri.log_sigma_mu, pri.log_sigma_sigma)
+    lp += _log_normal_scalar(log_tau, pri.log_tau_mu, pri.log_tau_sigma)
+
+    # Uniform prior in beta on [beta_min, 1] using a logistic transform beta=beta_min+(1-beta_min)*sigmoid(z).
+    # Adds the Jacobian |dbeta/dz| = (1-beta_min)*w*(1-w).
+    w = _sigmoid(z_beta)
+    jac = (1.0 - float(beta_min)) * w * (1.0 - w)
+    lp += math.log(max(jac, 1e-300))
+    return float(lp)
+
+
 def _pack_initial_h1(evt: EventData) -> np.ndarray:
     # Start at published reco.
     # Convert reco_dir to (theta,phi).
@@ -400,6 +510,12 @@ def _pack_initial_h3(evt: EventData) -> np.ndarray:
         ],
         dtype=np.float64,
     )
+
+
+def _pack_initial_h4(evt: EventData) -> np.ndarray:
+    # z_beta=+8 puts beta extremely close to 1 without sitting exactly at the boundary.
+    x = _pack_initial_h1(evt)
+    return np.concatenate([x, np.array([8.0], dtype=np.float64)], axis=0)
 
 
 def _fit_map_generic(
@@ -606,6 +722,51 @@ def run_model_comparison(
     # --- H0: time-uniform background (no parameters)
     logZ_h0 = float(-len(hit_t) * math.log(float(t_max - t_min)))
 
+    # --- H4: single track with beta<1 (LLCP-like) timing
+    beta_min = (1.0 / float(WATER_INDEX)) + 1e-4
+    x0_h4 = _pack_initial_h4(evt)
+    bounds_h4 = [
+        (None, None),
+        (None, None),
+        (None, None),
+        (1e-6, math.pi - 1e-6),
+        (0.0, 2.0 * math.pi),
+        (float(evt.reco_t_ns) - 10_000.0, float(evt.reco_t_ns) + 10_000.0),
+        (math.log(0.2), math.log(30.0)),
+        (math.log(1.0), math.log(2_000.0)),
+        (None, None),  # z_beta
+    ]
+
+    def neg_log_joint_h4(x: np.ndarray) -> float:
+        lp = _logprior_h4_beta_track(x, evt=evt, pri=pri, beta_min=beta_min)
+        if not np.isfinite(lp):
+            return float("inf")
+        ll = _loglik_single_track_beta(
+            x,
+            hit_pos_m=hit_pos,
+            hit_t_ns=hit_t,
+            t_min_ns=t_min,
+            t_max_ns=t_max,
+            outlier_frac=lik.outlier_frac,
+            beta_min=beta_min,
+        )
+        if not np.isfinite(ll):
+            return float("inf")
+        return -(ll + lp)
+
+    step_h4 = np.array([0.5, 0.5, 0.5, 2e-4, 2e-4, 1.0, 1e-2, 1e-2, 0.05], dtype=np.float64)
+    fit_h4 = _fit_map_generic(
+        x0=x0_h4,
+        bounds=bounds_h4,
+        neg_log_joint=neg_log_joint_h4,
+        step=step_h4,
+        restarts=2,
+        seed=config.seed + 3,
+    )
+    log_joint_h4 = -float(fit_h4["neg_log_joint_at_map"])
+    H4 = fit_h4["hessian"] + fit_h4["hessian_jitter"] * np.eye(9)
+    logZ_h4 = laplace_log_evidence(fit_h4["map_x"], H4, log_joint_at_map=log_joint_h4)
+
     # Summaries.
     def unpack_dir(x: np.ndarray) -> dict[str, float]:
         theta = float(x[3])
@@ -626,6 +787,19 @@ def run_model_comparison(
     b1, b2 = _orthonormal_basis_perp(u2)
     offset_vec = float(x2[8]) * b1 + float(x2[9]) * b2
     offset_norm_m = float(np.linalg.norm(offset_vec))
+
+    # Beta-track derived params.
+    x4 = np.asarray(fit_h4["map_x"], dtype=np.float64)
+    w4 = _sigmoid(float(x4[8]))
+    beta4 = float(beta_min + (1.0 - beta_min) * w4)
+    beta_sigma = None
+    try:
+        cov4 = np.linalg.inv(H4)
+        zsig = float(math.sqrt(max(0.0, float(cov4[8, 8]))))
+        db_dz = (1.0 - float(beta_min)) * w4 * (1.0 - w4)
+        beta_sigma = float(abs(db_dz) * zsig)
+    except Exception:
+        beta_sigma = None
 
     results = {
         "inputs": {
@@ -683,6 +857,20 @@ def run_model_comparison(
             "H0_time_uniform": {
                 "log_evidence_exact": logZ_h0,
             },
+            "H4_beta_track": {
+                "map": {
+                    "pos_m": [float(v) for v in x4[0:3]],
+                    "t0_ns": float(x4[5]),
+                    "log_sigma_ns": float(x4[6]),
+                    "log_tau_ns": float(x4[7]),
+                    "beta_min": float(beta_min),
+                    "beta": beta4,
+                    "beta_sigma_laplace": beta_sigma,
+                    **unpack_dir(x4),
+                },
+                "log_joint_at_map": log_joint_h4,
+                "log_evidence_laplace": logZ_h4,
+            },
         },
         "bayes_factors": {
             "logB_H2_over_H1": float(logZ_h2 - logZ_h1),
@@ -692,12 +880,16 @@ def run_model_comparison(
             "logB_H1_over_H0": float(logZ_h1 - logZ_h0),
             "logB_H2_over_H0": float(logZ_h2 - logZ_h0),
             "logB_H3_over_H0": float(logZ_h3 - logZ_h0),
+            "logB_H4_over_H1": float(logZ_h4 - logZ_h1),
+            "logB_H1_over_H4": float(logZ_h1 - logZ_h4),
+            "logB_H4_over_H0": float(logZ_h4 - logZ_h0),
         },
         "notes": [
             "Evidences for H1/H2 are Laplace approximations around the MAP (Gaussian approximation to the posterior).",
             "H2 is a simplified 'bundle' model: two parallel tracks with a transverse offset and a mixture weight; shared direction and time.",
             "H3 is a cascade-like point-source timing model (t_pred=t0+|r-r0|/v_g).",
             "H0 is a minimal null: hit times are i.i.d. uniform over the selected hit time range.",
+            "H4 is a single-track timing model with beta<1 (LLCP-like); Cherenkov angle uses cos(theta_c)=1/(n*beta).",
         ],
     }
 
